@@ -5,9 +5,7 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
-from langchain.chains import RetrievalQA
-from langchain_community.llms import HuggingFacePipeline
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline
+from transformers import pipeline
 import torch
 
 # Configure Streamlit page
@@ -60,25 +58,31 @@ def initialize_session_state():
 def load_qa_model():
     """Load and cache the question-answering model"""
     try:
-        model_name = "google/flan-t5-small"  # Better for Q&A tasks
-        
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
-        model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
-        
-        # Create pipeline for text generation
-        pipe = pipeline(
-            "text2text-generation",
-            model=model,
-            tokenizer=tokenizer,
-            max_length=1024,
-            temperature=0.3,
-            do_sample=True,
+        # Use a dedicated question-answering model instead of text generation
+        qa_pipeline = pipeline(
+            "question-answering",
+            model="distilbert-base-cased-distilled-squad",
+            tokenizer="distilbert-base-cased-distilled-squad",
             device=-1  # CPU
         )
         
-        return pipe
+        return qa_pipeline
     except Exception as e:
         st.error(f"Error loading model: {e}")
+        return None
+
+@st.cache_resource
+def load_summarization_model():
+    """Load summarization model for fallback"""
+    try:
+        summarizer = pipeline(
+            "summarization",
+            model="facebook/bart-large-cnn",
+            device=-1
+        )
+        return summarizer
+    except Exception as e:
+        st.warning(f"Summarization model not available: {e}")
         return None
 
 def load_and_process_pdf(uploaded_file):
@@ -93,9 +97,9 @@ def load_and_process_pdf(uploaded_file):
         loader = PyPDFLoader(tmp_file_path)
         pages = loader.load()
         
-        # Split text into smaller chunks
+        # Split text into chunks
         text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=500,  # Smaller chunks
+            chunk_size=500,
             chunk_overlap=100,
             length_function=len
         )
@@ -118,42 +122,106 @@ def load_and_process_pdf(uploaded_file):
             os.unlink(tmp_file_path)
         raise e
 
-def answer_question_directly(question, vectorstore, qa_pipeline):
-    """Answer questions directly without RetrievalQA chain"""
+def answer_question_with_qa_model(question, vectorstore, qa_pipeline, summarizer=None):
+    """Answer questions using dedicated Q&A model"""
     try:
         # Get relevant documents
-        relevant_docs = vectorstore.similarity_search(question, k=2)
+        relevant_docs = vectorstore.similarity_search(question, k=3)
         
         if not relevant_docs:
             return "I couldn't find relevant information in the document to answer your question."
         
-        # Combine relevant text
-        context = " ".join([doc.page_content for doc in relevant_docs])
+        # Try Q&A with each relevant chunk and find best answer
+        best_answer = ""
+        best_score = 0
         
-        # Truncate context if too long
-        max_context_length = 400
-        if len(context) > max_context_length:
-            context = context[:max_context_length] + "..."
-        
-        # Create a proper prompt for the model
-        prompt = f"Question: {question}\n\nContext: {context}\n\nAnswer based on the context:"
-        
-        # Generate answer
-        response = qa_pipeline(prompt, max_length=150, min_length=10)
-        
-        if response and len(response) > 0:
-            answer = response[0]['generated_text']
+        for doc in relevant_docs:
+            context = doc.page_content
             
-            # Clean up the answer - remove the prompt part
-            if "Answer based on the context:" in answer:
-                answer = answer.split("Answer based on the context:")[-1].strip()
+            # Skip very short contexts
+            if len(context.strip()) < 50:
+                continue
+                
+            try:
+                # Limit context length for Q&A model
+                if len(context) > 1000:
+                    context = context[:1000]
+                
+                result = qa_pipeline(question=question, context=context)
+                
+                # Keep track of best answer based on confidence score
+                if result['score'] > best_score and len(result['answer'].strip()) > 10:
+                    best_answer = result['answer']
+                    best_score = result['score']
+                    
+            except Exception as e:
+                continue
+        
+        # If we found a good answer, return it
+        if best_score > 0.1 and best_answer:
+            confidence_text = f" (Confidence: {best_score:.2f})" if best_score < 0.8 else ""
+            return f"{best_answer}{confidence_text}"
+        
+        # Fallback: Try to provide a summary of relevant content
+        combined_context = " ".join([doc.page_content for doc in relevant_docs[:2]])
+        
+        if summarizer and len(combined_context) > 100:
+            try:
+                # Use summarization as fallback
+                if len(combined_context) > 1000:
+                    combined_context = combined_context[:1000]
+                    
+                summary = summarizer(combined_context, max_length=100, min_length=30, do_sample=False)
+                return f"Based on the document content: {summary[0]['summary_text']}"
+                
+            except Exception as e:
+                pass
+        
+        # Final fallback: return relevant text directly
+        if combined_context:
+            sentences = combined_context.split('. ')
+            relevant_sentences = [s for s in sentences if any(word.lower() in s.lower() 
+                                for word in question.split() if len(word) > 3)]
             
-            return answer if answer else "I couldn't generate a clear answer from the document."
-        else:
-            return "I couldn't generate an answer. Please try rephrasing your question."
-            
+            if relevant_sentences:
+                return '. '.join(relevant_sentences[:2]) + '.'
+        
+        return "I found some information but couldn't extract a specific answer. Try asking about specific topics mentioned in the document."
+        
     except Exception as e:
         return f"Error processing question: {str(e)}"
+
+def generate_summary(vectorstore, summarizer=None):
+    """Generate document summary"""
+    try:
+        # Get a sample of documents to summarize
+        all_docs = vectorstore.similarity_search("", k=10)
+        
+        if not all_docs:
+            return "No content available for summary."
+        
+        # Combine text from multiple chunks
+        combined_text = " ".join([doc.page_content for doc in all_docs[:5]])
+        
+        if summarizer and len(combined_text) > 200:
+            try:
+                if len(combined_text) > 1500:
+                    combined_text = combined_text[:1500]
+                
+                summary = summarizer(combined_text, max_length=150, min_length=50, do_sample=False)
+                return summary[0]['summary_text']
+                
+            except Exception as e:
+                pass
+        
+        # Fallback: extract key sentences
+        sentences = combined_text.split('. ')
+        # Take first few sentences as basic summary
+        summary_sentences = sentences[:3]
+        return '. '.join(summary_sentences) + '.'
+        
+    except Exception as e:
+        return f"Error generating summary: {str(e)}"
 
 def main():
     # Header
@@ -167,9 +235,10 @@ def main():
     # Initialize session state
     initialize_session_state()
     
-    # Load QA model
-    with st.spinner("Loading AI model..."):
+    # Load models
+    with st.spinner("Loading AI models..."):
         qa_pipeline = load_qa_model()
+        summarizer = load_summarization_model()
     
     if qa_pipeline is None:
         st.error("Failed to load the question-answering model. Please refresh the page.")
@@ -207,11 +276,25 @@ def main():
                             st.error(f"Error processing PDF: {str(e)}")
             else:
                 st.success("✅ PDF is ready for questions!")
-                if st.button("Upload New PDF"):
-                    st.session_state.pdf_processed = False
-                    st.session_state.vectorstore = None
-                    st.session_state.messages = []
-                    st.rerun()
+                
+                # Make summary button more prominent
+                st.markdown("### 📋 Quick Actions")
+                
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    if st.button("📝 Get Summary", type="secondary", use_container_width=True):
+                        with st.spinner("Generating summary..."):
+                            summary = generate_summary(st.session_state.vectorstore, summarizer)
+                            st.session_state.messages.append({"role": "assistant", "content": f"📄 **Document Summary:**\n\n{summary}"})
+                            st.rerun()
+                
+                with col2:
+                    if st.button("🗑️ New PDF", type="secondary", use_container_width=True):
+                        st.session_state.pdf_processed = False
+                        st.session_state.vectorstore = None
+                        st.session_state.messages = []
+                        st.rerun()
     
     # Main chat interface
     if st.session_state.pdf_processed and st.session_state.vectorstore is not None:
@@ -235,11 +318,12 @@ def main():
             with st.chat_message("assistant"):
                 with st.spinner("Analyzing document..."):
                     try:
-                        # Get answer using direct method
-                        answer = answer_question_directly(
+                        # Get answer using Q&A model
+                        answer = answer_question_with_qa_model(
                             prompt, 
                             st.session_state.vectorstore, 
-                            qa_pipeline
+                            qa_pipeline,
+                            summarizer
                         )
                         
                         # Display answer
@@ -266,15 +350,21 @@ def main():
             st.markdown("""
             1. **Upload PDF**: Choose a PDF file from your computer
             2. **Process PDF**: Click "Process PDF" to analyze the document
-            3. **Ask Questions**: Start chatting about the PDF content!
+            3. **Get Summary**: Use the "Get Document Summary" button for an overview
+            4. **Ask Questions**: Start chatting about the PDF content!
             
             **Example questions:**
             - "What is this document about?"
-            - "Can you summarize the main points?"
-            - "What does it say about [specific topic]?"
-            - "What are the key conclusions?"
+            - "Who are the main authors?"
+            - "What methodology was used?"
+            - "What are the key findings?"
+            - "What are the conclusions?"
             
-            **Note**: This app uses free Hugging Face models.
+            **Features:**
+            - Uses DistilBERT for accurate question answering
+            - Provides confidence scores for answers
+            - Includes document summarization
+            - No repetitive responses
             """)
 
     # Footer
