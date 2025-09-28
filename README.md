@@ -140,8 +140,6 @@ pdf-chatbot-langchain/
 ## Use Cases
 
 - Research paper analysis
-- Legal document review
-- Technical manual exploration
 - Educational content study
 - Report summarization
 
